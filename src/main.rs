@@ -432,8 +432,53 @@ fn parse_iso(b: &[u8]) -> Option<i64> {
     Some(ms)
 }
 
+/// 8 ASCII digits (little-endian load) -> value; caller verified they are digits.
+#[inline(always)]
+fn swar8(x: u64) -> u64 {
+    let x = x - 0x3030_3030_3030_3030;
+    let x = (x.wrapping_mul(10) + (x >> 8)) & 0x00FF_00FF_00FF_00FF;
+    let x = (x.wrapping_mul(100) + (x >> 16)) & 0x0000_FFFF_0000_FFFF;
+    (x.wrapping_mul(10000) + (x >> 32)) & 0xFFFF_FFFF
+}
+#[inline(always)]
+fn all_digits8(x: u64) -> bool {
+    let t = x ^ 0x3030_3030_3030_3030;
+    ((t & 0xF0F0_F0F0_F0F0_F0F0) | (t.wrapping_add(0x0606_0606_0606_0606) & 0x1010_1010_1010_1010)) == 0
+}
+
+/// ingest_ts is always valid F1 (rules); fast path without re-validation, falls back if the shape differs.
+#[inline(always)]
+fn parse_ingest(b: &[u8]) -> Option<i64> {
+    if b.len() == 20 && b[19] == b'Z' && b[10] == b'T' {
+        let a = u64::from_le_bytes(b[0..8].try_into().unwrap()) ^ 0x3030_3030_3030_3030;
+        let c = u64::from_le_bytes(b[8..16].try_into().unwrap()) ^ 0x3030_3030_3030_3030;
+        let g = |x: u64, i: u32| -> i64 { ((x >> (8 * i)) & 0xFF) as i64 };
+        let y = g(a, 0) * 1000 + g(a, 1) * 100 + g(a, 2) * 10 + g(a, 3);
+        let mo = g(a, 5) * 10 + g(a, 6);
+        if y >= Y0 && y < Y0 + NY && mo >= 1 && mo <= 12 {
+            let d = g(c, 0) * 10 + g(c, 1);
+            let h = g(c, 3) * 10 + g(c, 4);
+            let mi = g(c, 6) * 10 + g(c, 7);
+            let sec = ((b[17] - b'0') as i64) * 10 + (b[18] - b'0') as i64;
+            let days = month_table()[((y - Y0) * 12 + mo - 1) as usize] + d - 1;
+            return Some((days * 86400 + h * 3600 + mi * 60 + sec) * 1000);
+        }
+    }
+    parse_ts(b)
+}
+
 #[inline(always)]
 fn parse_f3(b: &[u8]) -> Option<i64> {
+    if b.len() == 13 {
+        let x = u64::from_le_bytes(b[0..8].try_into().unwrap());
+        let y = u64::from_le_bytes(b[5..13].try_into().unwrap());
+        if all_digits8(x) && all_digits8(y) {
+            // digits 0..8 and 5..13 overlap; value = first5 * 1e8 + last8
+            let hi = swar8(x) / 1000; // first 5 digits
+            let lo = swar8(y);
+            return Some((hi * 100_000_000 + lo) as i64);
+        }
+    }
     if b.is_empty() {
         return None;
     }
@@ -510,6 +555,7 @@ impl<V: Copy> StrMap<V> {
 
 // ---------------------------------------------------------------- software write-combining scatter
 const SWC: usize = 16;
+const DEAD: u8 = 254;
 struct Scatter<T: Copy> {
     buf: Vec<[std::mem::MaybeUninit<T>; SWC]>,
     cnt: [u8; NP],
@@ -524,9 +570,10 @@ impl<T: Copy> Scatter<T> {
         }
     }
     #[inline(always)]
-    fn push(&mut self, p: usize, v: T) {
+    fn push(&mut self, p: usize, v: T) -> usize {
         unsafe {
             let c = *self.cnt.get_unchecked(p) as usize;
+            let at = self.out.get_unchecked(p).len() + c;
             let b = self.buf.get_unchecked_mut(p);
             b.get_unchecked_mut(c).write(v);
             if c + 1 == SWC {
@@ -536,6 +583,7 @@ impl<T: Copy> Scatter<T> {
             } else {
                 *self.cnt.get_unchecked_mut(p) = (c + 1) as u8;
             }
+            at
         }
     }
     fn finish(mut self) -> Vec<Vec<T>> {
@@ -556,25 +604,49 @@ impl<T: Copy> Scatter<T> {
 #[derive(Clone, Copy)]
 struct ERec {
     h: u64,
-    ingest: i64,
-    eid: S,
-    uid: S,
-    ts: i64,
+    uh: u64,
+    uh2: u64,
+    eidp: *const u8,
+    ts: i32,     // ms relative to TB (valid events only)
+    ingest: i32, // seconds relative to TB/1000
     price: u32,
     cat: u16,
+    elen: u16,
+    uoff: u16,
+    ulen: u16,
     typ: u8,
     valid: bool,
 }
+impl ERec {
+    #[inline(always)]
+    fn eid(&self) -> S {
+        unsafe { std::slice::from_raw_parts(self.eidp, self.elen as usize) }
+    }
+    #[inline(always)]
+    fn uidp(&self) -> *const u8 {
+        unsafe { self.eidp.add(self.uoff as usize) }
+    }
+}
+unsafe impl Sync for ERec {}
 
 #[derive(Clone, Copy)]
 struct PEv {
     nh: u64,
-    ts: i64,
-    name: S,
+    namep: *const u8,
+    ts: i32,
     price: u32,
+    nlen: u16,
     cat: u16,
     typ: u8,
 }
+impl PEv {
+    #[inline(always)]
+    fn name(&self) -> S {
+        unsafe { std::slice::from_raw_parts(self.namep, self.nlen as usize) }
+    }
+}
+unsafe impl Send for PEv {}
+unsafe impl Sync for PEv {}
 
 #[derive(Clone, Copy)]
 struct PCl {
@@ -622,12 +694,15 @@ struct LEnt {
 struct UEv {
     uh: u64,
     uh2: u64,
-    uid: S,
-    ts: i64,
+    uidp: *const u8,
+    ts: i32,
     price: u32,
+    ulen: u16,
     cat: u16,
     typ: u8,
 }
+unsafe impl Send for UEv {}
+unsafe impl Sync for UEv {}
 #[derive(Clone, Copy)]
 struct UCl {
     uh: u64,
@@ -680,6 +755,7 @@ fn main() {
     let out = PathBuf::from(&out_dir);
 
     let (ws, we) = read_manifest(&data.join("manifest.json"));
+    let tb = ws - WEEK; // time base for compact i32 offsets
 
     // ---- map all input files
     let ev_files = list_csv(&data.join("events"));
@@ -879,7 +955,8 @@ fn main() {
                     return;
                 }
                 let h = xxh3_64(eid);
-                let ingest = parse_ts(ing_s).unwrap_or(i64::MAX);
+                let ingest = parse_ingest(ing_s).unwrap_or(i64::MAX);
+                let ingest_rel: i32 = if ingest == i64::MAX { i32::MAX } else { ((ingest - tb).div_euclid(1000)).clamp(i32::MIN as i64 + 1, i32::MAX as i64 - 1) as i32 };
                 let ts = parse_ts(ts_s);
                 let typ: u8 = match typ_s {
                     b"view" => 0,
@@ -910,7 +987,13 @@ fn main() {
                         None => valid = false,
                     }
                 }
-                parts.push((h >> NP_SHIFT) as usize, ERec { h, ingest, eid, uid, ts: tsv, price, cat, typ, valid });
+                let (uh, uh2) = if valid { hh(uid) } else { (0, 0) };
+                let uoff = (uid.as_ptr() as usize).wrapping_sub(eid.as_ptr() as usize);
+                if eid.len() > 0xFFFF || uid.len() > 0xFFFF || uoff > 0xFFFF {
+                    panic!("field too long");
+                }
+                let tsr = if valid { (tsv - tb) as i32 } else { 0 };
+                parts.push((h >> NP_SHIFT) as usize, ERec { h, uh, uh2, eidp: eid.as_ptr(), ts: tsr, ingest: ingest_rel, price, cat, elen: eid.len() as u16, uoff: uoff as u16, ulen: uid.len() as u16, typ, valid });
             });
             parts.finish()
         })
@@ -924,40 +1007,45 @@ fn main() {
             let n: usize = parted.iter().map(|p| p[pi].len()).sum();
             let est = n / NP + 16;
             let mut outp = Scatter::<UEv>::new(est);
-            let mut tab: HashTable<(u64, i64, *const ERec)> = HashTable::with_capacity(n);
+            let mut tab: HashTable<(u64, i32, *const ERec, u32)> = HashTable::with_capacity(n);
+            let mut dead: Vec<(u32, u32)> = Vec::new();
+            const NONE: u32 = u32::MAX;
             for p in &parted {
                 for r in &p[pi] {
                     let rp = r as *const ERec;
                     let hh_ = r.h.rotate_left(24);
-                    match tab.find_mut(hh_, |e| e.0 == r.h && unsafe { (*e.2).eid == r.eid }) {
+                    match tab.find_mut(hh_, |e| e.0 == r.h && unsafe { (*e.2).eid() == r.eid() }) {
                         Some(e) => {
                             if r.ingest < e.1 {
+                                if e.3 != NONE {
+                                    let prev = unsafe { &*e.2 };
+                                    dead.push(((prev.uh >> NP_SHIFT) as u32, e.3));
+                                }
                                 e.1 = r.ingest;
                                 e.2 = rp;
+                                e.3 = if r.valid {
+                                    outp.push((r.uh >> NP_SHIFT) as usize, UEv { uh: r.uh, uh2: r.uh2, uidp: r.uidp(), ts: r.ts, price: r.price, ulen: r.ulen, cat: r.cat, typ: r.typ }) as u32
+                                } else {
+                                    NONE
+                                };
                             }
                         }
                         None => {
-                            tab.insert_unique(hh_, (r.h, r.ingest, rp), |e| e.0.rotate_left(24));
+                            let loc = if r.valid {
+                                outp.push((r.uh >> NP_SHIFT) as usize, UEv { uh: r.uh, uh2: r.uh2, uidp: r.uidp(), ts: r.ts, price: r.price, ulen: r.ulen, cat: r.cat, typ: r.typ }) as u32
+                            } else {
+                                NONE
+                            };
+                            tab.insert_unique(hh_, (r.h, r.ingest, rp, loc), |e| e.0.rotate_left(24));
                         }
                     }
                 }
             }
-            for p in &parted {
-                for r in &p[pi] {
-                    if !r.valid {
-                        continue;
-                    }
-                    let rp = r as *const ERec;
-                    let win = tab.find(r.h.rotate_left(24), |e| e.0 == r.h && (e.2 == rp || unsafe { (*e.2).eid == r.eid }));
-                    if let Some(e) = win {
-                        if e.2 == rp {
-                            let (uh, uh2) = hh(r.uid);
-                            outp.push((uh >> NP_SHIFT) as usize, UEv { uh, uh2, uid: r.uid, ts: r.ts, price: r.price, cat: r.cat, typ: r.typ });
-                        }
-                    }
-                }
+            let mut outp = outp.finish();
+            for (bk, i) in dead {
+                outp[bk as usize][i as usize].typ = DEAD;
             }
-            outp.finish()
+            outp
         })
         .collect();
     drop(parted);
@@ -1007,11 +1095,14 @@ fn main() {
             let mut co = Scatter::<PCl>::new(ce);
             for p in &uevs {
                 for u in &p[bi] {
-                    let (nh, name) = match t.find(u.uh.rotate_left(24), |x| x.h == u.uh && x.h2 == u.uh2) {
-                        Some(x) => (x.nh, x.name),
-                        None => (u.uh, u.uid),
+                    if u.typ == DEAD {
+                        continue;
+                    }
+                    let (nh, namep, nlen) = match t.find(u.uh.rotate_left(24), |x| x.h == u.uh && x.h2 == u.uh2) {
+                        Some(x) => (x.nh, x.name.as_ptr(), x.name.len() as u16),
+                        None => (u.uh, u.uidp, u.ulen),
                     };
-                    eo.push((nh >> NP_SHIFT) as usize, PEv { nh, ts: u.ts, name, price: u.price, cat: u.cat, typ: u.typ });
+                    eo.push((nh >> NP_SHIFT) as usize, PEv { nh, namep, ts: u.ts, price: u.price, nlen, cat: u.cat, typ: u.typ });
                 }
             }
             for p in &ucls {
@@ -1144,7 +1235,7 @@ fn main() {
             for q in 0..np {
                 let i = pstart[q] as usize;
                 let pe = pstart[q + 1] as usize;
-                let name = ev[i].name;
+                let name = ev[i].name();
                 let cs = cstart[q] as usize;
                 let ce = cstart[q + 1] as usize;
                 let (mut lo, mut hi) = (cs, cs);
@@ -1172,14 +1263,14 @@ fn main() {
                 let mut k = i;
                 while k < pe {
                     let sess_begin = k;
-                    let start = ev[k].ts;
+                    let start = ev[k].ts as i64 + tb;
                     let mut last = start;
                     let mut cnt = 0i64;
                     let mut rev = 0i64;
                     let mut purch = false;
-                    while k < pe && ev[k].ts - last <= GAP {
+                    while k < pe && ev[k].ts as i64 + tb - last <= GAP {
                         let e = &ev[k];
-                        last = e.ts;
+                        last = e.ts as i64 + tb;
                         cnt += 1;
                         if e.typ == 2 {
                             purch = true;
