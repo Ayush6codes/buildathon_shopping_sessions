@@ -713,6 +713,15 @@ struct UCl {
 }
 unsafe impl Send for ERec {}
 
+#[inline(always)]
+fn resolve_ev(ltabs: &[HashTable<LEnt>], r: &ERec) -> PEv {
+    let (nh, namep, nlen) = match ltabs[(r.uh >> NP_SHIFT) as usize].find(r.uh.rotate_left(24), |x| x.h == r.uh && x.h2 == r.uh2) {
+        Some(x) => (x.nh, x.name.as_ptr(), x.name.len() as u16),
+        None => (r.uh, r.uidp(), r.ulen),
+    };
+    PEv { nh, namep, ts: r.ts, price: r.price, nlen, cat: r.cat, typ: r.typ }
+}
+
 #[inline]
 fn hh(s: &[u8]) -> (u64, u64) {
     let v = xxhash_rust::xxh3::xxh3_128(s);
@@ -877,29 +886,47 @@ fn main() {
         goff[bi + 1] = goff[bi] + lb[bi].0.len() as u32;
     }
     let nid = goff[NP] as usize;
-    let mut ends = vec![0u32; npairs * 2];
-    for bi in 0..NP {
+    // slot -> global id (parallel; each slot written exactly once)
+    let ends: Vec<AtomicU32> = (0..npairs * 2).map(|_| AtomicU32::new(0)).collect();
+    (0..NP).into_par_iter().for_each(|bi| {
         let g = goff[bi];
         for &(slot, l) in &lb[bi].1 {
-            ends[slot as usize] = g + l;
+            ends[slot as usize].store(g + l, Ordering::Relaxed);
         }
-    }
-    let mut parent: Vec<u32> = (0..nid as u32).collect();
-    for k in 0..npairs {
-        let ra = find(&mut parent, ends[2 * k]);
-        let rb = find(&mut parent, ends[2 * k + 1]);
-        if ra != rb {
-            if ra < rb {
-                parent[rb as usize] = ra;
-            } else {
-                parent[ra as usize] = rb;
+    });
+    // lock-free union-find: link the larger root under the smaller one
+    let par: Vec<AtomicU32> = (0..nid as u32).map(AtomicU32::new).collect();
+    let afind = |mut x: u32| -> u32 {
+        loop {
+            let px = par[x as usize].load(Ordering::Relaxed);
+            if px == x {
+                return x;
+            }
+            let gp = par[px as usize].load(Ordering::Relaxed);
+            if gp != px {
+                let _ = par[x as usize].compare_exchange_weak(px, gp, Ordering::Relaxed, Ordering::Relaxed);
+            }
+            x = px;
+        }
+    };
+    (0..npairs).into_par_iter().with_min_len(4096).for_each(|k| {
+        let mut a = ends[2 * k].load(Ordering::Relaxed);
+        let mut b = ends[2 * k + 1].load(Ordering::Relaxed);
+        loop {
+            a = afind(a);
+            b = afind(b);
+            if a == b {
+                return;
+            }
+            let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+            if par[hi as usize].compare_exchange(hi, lo, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                return;
             }
         }
-    }
-    for i in 0..nid {
-        let r = find(&mut parent, i as u32);
-        parent[i] = r;
-    }
+    });
+    let parent: Vec<u32> = (0..nid as u32).into_par_iter().map(|i| afind(i)).collect();
+    drop(par);
+    drop(ends);
     let mut idstr: Vec<S> = Vec::with_capacity(nid);
     for bi in 0..NP {
         idstr.extend(lb[bi].0.iter().map(|x| x.2));
@@ -1001,13 +1028,14 @@ fn main() {
     tlog!(t0, "events parsed: {} chunks", ev_chunks.len());
 
     // ---- dedup per eid partition -> survivors bucketed by uid hash
-    let uevs: Vec<Vec<Vec<UEv>>> = (0..NP)
+    let deduped: Vec<Vec<Vec<PEv>>> = (0..NP)
         .into_par_iter()
         .map(|pi| {
             let n: usize = parted.iter().map(|p| p[pi].len()).sum();
             let est = n / NP + 16;
-            let mut outp = Scatter::<UEv>::new(est);
-            let mut tab: HashTable<(u64, i32, *const ERec, u32)> = HashTable::with_capacity(n);
+            let mut outp = Scatter::<PEv>::new(est);
+            let ltabs = &ltabs;
+            let mut tab: HashTable<(u64, i32, *const ERec, u32, u16)> = HashTable::with_capacity(n);
             let mut dead: Vec<(u32, u32)> = Vec::new();
             const NONE: u32 = u32::MAX;
             for p in &parted {
@@ -1018,25 +1046,29 @@ fn main() {
                         Some(e) => {
                             if r.ingest < e.1 {
                                 if e.3 != NONE {
-                                    let prev = unsafe { &*e.2 };
-                                    dead.push(((prev.uh >> NP_SHIFT) as u32, e.3));
+                                    dead.push((e.4 as u32, e.3));
                                 }
                                 e.1 = r.ingest;
                                 e.2 = rp;
-                                e.3 = if r.valid {
-                                    outp.push((r.uh >> NP_SHIFT) as usize, UEv { uh: r.uh, uh2: r.uh2, uidp: r.uidp(), ts: r.ts, price: r.price, ulen: r.ulen, cat: r.cat, typ: r.typ }) as u32
+                                if r.valid {
+                                    let pe = resolve_ev(ltabs, r);
+                                    let bk = (pe.nh >> NP_SHIFT) as usize;
+                                    e.3 = outp.push(bk, pe) as u32;
+                                    e.4 = bk as u16;
                                 } else {
-                                    NONE
-                                };
+                                    e.3 = NONE;
+                                }
                             }
                         }
                         None => {
-                            let loc = if r.valid {
-                                outp.push((r.uh >> NP_SHIFT) as usize, UEv { uh: r.uh, uh2: r.uh2, uidp: r.uidp(), ts: r.ts, price: r.price, ulen: r.ulen, cat: r.cat, typ: r.typ }) as u32
+                            let (loc, bk) = if r.valid {
+                                let pe = resolve_ev(ltabs, r);
+                                let bk = (pe.nh >> NP_SHIFT) as usize;
+                                (outp.push(bk, pe) as u32, bk as u16)
                             } else {
-                                NONE
+                                (NONE, 0)
                             };
-                            tab.insert_unique(hh_, (r.h, r.ingest, rp, loc), |e| e.0.rotate_left(24));
+                            tab.insert_unique(hh_, (r.h, r.ingest, rp, loc, bk), |e| e.0.rotate_left(24));
                         }
                     }
                 }
@@ -1055,11 +1087,12 @@ fn main() {
     let cws = ws - WEEK;
     let cl_chunk_size = (cl_total / (nthreads * 4)).clamp(1 << 20, 64 << 20);
     let cl_chunks = chunks_of(&cl_bufs, cl_chunk_size);
-    let ucls: Vec<Vec<Vec<UCl>>> = cl_chunks
+    let clicks: Vec<Vec<Vec<PCl>>> = cl_chunks
         .par_iter()
         .map(|&c| {
             let est = c.len() / 48 / NP + 16;
-            let mut parts = Scatter::<UCl>::new(est);
+            let mut parts = Scatter::<PCl>::new(est);
+            let ltabs = &ltabs;
             let ctx = &*ctx;
             scan::<4>(c, |f| {
                 let [cid, uid, camp_s, ts_s] = f;
@@ -1075,51 +1108,17 @@ fn main() {
                     None => return,
                 };
                 let (uh, uh2) = hh(uid);
-                parts.push((uh >> NP_SHIFT) as usize, UCl { uh, uh2, ts, cid, camp: ci });
+                let nh = match ltabs[(uh >> NP_SHIFT) as usize].find(uh.rotate_left(24), |x| x.h == uh && x.h2 == uh2) {
+                    Some(x) => x.nh,
+                    None => uh,
+                };
+                parts.push((nh >> NP_SHIFT) as usize, PCl { nh, ts, cid, camp: ci });
             });
             parts.finish()
         })
         .collect();
     tlog!(t0, "clicks parsed: {} chunks", cl_chunks.len());
 
-    // ---- resolve persons per uid bucket (small, cache-resident link tables)
-    let resolved: Vec<(Vec<Vec<PEv>>, Vec<Vec<PCl>>)> = (0..NP)
-        .into_par_iter()
-        .map(|bi| {
-            let t = &ltabs[bi];
-            let ne: usize = uevs.iter().map(|p| p[bi].len()).sum();
-            let nc: usize = ucls.iter().map(|p| p[bi].len()).sum();
-            let ee = ne / NP + 16;
-            let ce = nc / NP + 16;
-            let mut eo = Scatter::<PEv>::new(ee);
-            let mut co = Scatter::<PCl>::new(ce);
-            for p in &uevs {
-                for u in &p[bi] {
-                    if u.typ == DEAD {
-                        continue;
-                    }
-                    let (nh, namep, nlen) = match t.find(u.uh.rotate_left(24), |x| x.h == u.uh && x.h2 == u.uh2) {
-                        Some(x) => (x.nh, x.name.as_ptr(), x.name.len() as u16),
-                        None => (u.uh, u.uidp, u.ulen),
-                    };
-                    eo.push((nh >> NP_SHIFT) as usize, PEv { nh, namep, ts: u.ts, price: u.price, nlen, cat: u.cat, typ: u.typ });
-                }
-            }
-            for p in &ucls {
-                for u in &p[bi] {
-                    let nh = match t.find(u.uh.rotate_left(24), |x| x.h == u.uh && x.h2 == u.uh2) {
-                        Some(x) => x.nh,
-                        None => u.uh,
-                    };
-                    co.push((nh >> NP_SHIFT) as usize, PCl { nh, ts: u.ts, cid: u.cid, camp: u.camp });
-                }
-            }
-            (eo.finish(), co.finish())
-        })
-        .collect();
-    drop(uevs);
-    drop(ucls);
-    let (deduped, clicks): (Vec<Vec<Vec<PEv>>>, Vec<Vec<Vec<PCl>>>) = resolved.into_iter().unzip();
     tlog!(t0, "persons resolved");
 
     // ---- per person-partition: sessionize, attribute, aggregate
@@ -1136,6 +1135,10 @@ fn main() {
             let mut pidx: Vec<u32> = Vec::with_capacity(ne);
             for p in &deduped {
                 for e in &p[pi] {
+                    if e.typ == DEAD {
+                        pidx.push(u32::MAX);
+                        continue;
+                    }
                     let hh = e.nh.rotate_left(24);
                     let id = match ptab.find(hh, |x| x.0 == e.nh) {
                         Some(x) => x.1,
@@ -1159,14 +1162,18 @@ fn main() {
             }
             pstart.push(acc);
             let mut ev: Vec<PEv> = Vec::with_capacity(ne);
-            unsafe { ev.set_len(ne) };
+            unsafe { ev.set_len(pstart[np] as usize) };
             {
                 let mut fill = pstart.clone();
                 let mut k = 0;
                 for p in &deduped {
                     for e in &p[pi] {
-                        let id = pidx[k] as usize;
+                        let id = pidx[k];
                         k += 1;
+                        if id == u32::MAX {
+                            continue;
+                        }
+                        let id = id as usize;
                         ev[fill[id] as usize] = *e;
                         fill[id] += 1;
                     }
