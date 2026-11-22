@@ -24,9 +24,22 @@ const NP_SHIFT: u32 = 56;
 macro_rules! tlog {
     ($t:expr, $($arg:tt)*) => {
         if std::env::var_os("SS_QUIET").is_none() {
-            eprintln!("[{:>8.1} ms] {}", $t.elapsed().as_secs_f64() * 1000.0, format!($($arg)*));
+            eprintln!("[{:>8.1} ms | cpu {:>7.0} ms] {}", $t.elapsed().as_secs_f64() * 1000.0, cpu_ms(), format!($($arg)*));
         }
     };
+}
+
+fn cpu_ms() -> f64 {
+    let s = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let r = s.rsplit(')').next().unwrap_or("");
+    let f: Vec<&str> = r.split_whitespace().collect();
+    if f.len() > 13 {
+        let u: f64 = f[11].parse().unwrap_or(0.0);
+        let st: f64 = f[12].parse().unwrap_or(0.0);
+        (u + st) * 10.0
+    } else {
+        0.0
+    }
 }
 
 // ---------------------------------------------------------------- files
@@ -169,80 +182,113 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
     (c, n, q)
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn m128(p: *const u8) -> (u128, u128, u128) {
+    use std::arch::x86_64::*;
+    let comma = _mm256_set1_epi8(b',' as i8);
+    let nl = _mm256_set1_epi8(b'\n' as i8);
+    let qt = _mm256_set1_epi8(b'"' as i8);
+    let mut c: u128 = 0;
+    let mut n: u128 = 0;
+    let mut q: u128 = 0;
+    for i in 0..4 {
+        let v = _mm256_loadu_si256(p.add(32 * i) as *const __m256i);
+        c |= (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, comma)) as u32 as u128) << (32 * i);
+        n |= (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, nl)) as u32 as u128) << (32 * i);
+        q |= (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, qt)) as u32 as u128) << (32 * i);
+    }
+    (c, n, q)
+}
+
+#[inline(always)]
+fn emit_line<const N: usize>(line: S, commas: &[usize; N], ncomma: usize, qc: u32, f: &mut impl FnMut([S; N])) {
+    if ncomma != N - 1 {
+        return;
+    }
+    let mut out: [S; N] = [&line[0..0]; N];
+    let mut st = 0usize;
+    for j in 0..N {
+        let en = if j < N - 1 { commas[j] } else { line.len() };
+        out[j] = unsafe { line.get_unchecked(st..en) };
+        st = en + 1;
+    }
+    if qc != 0 {
+        let mut g = 0u32;
+        for fld in out.iter_mut() {
+            let l = fld.len();
+            if l >= 2 && fld[0] == b'"' && fld[l - 1] == b'"' {
+                g += 2;
+                *fld = &fld[1..l - 1];
+            }
+        }
+        if g != qc {
+            return;
+        }
+    }
+    f(out);
+}
+
 /// Scan a chunk; for every well-formed line with exactly N fields call f with unquoted fields.
 #[inline(always)]
 fn scan<const N: usize>(c: S, mut f: impl FnMut([S; N])) {
     let n = c.len();
     let base = c.as_ptr();
-    let mut commas = [0usize; N];
-    let mut nf = 0usize;
-    let mut line_start = 0usize;
-    let mut qbase: u32 = 0;
-    let mut q_line_start: u32 = 0;
     let mut pos = 0usize;
-    let mut tail = [0u8; 64];
-    let handle = |ls: usize, le: usize, nf: usize, commas: &[usize; N], qc: u32, f: &mut dyn FnMut([S; N])| {
-        if nf != N - 1 {
-            return;
-        }
-        let mut out: [S; N] = [&c[0..0]; N];
-        let mut st = ls;
-        for k in 0..N {
-            let en = if k < N - 1 { commas[k] } else { le };
-            out[k] = &c[st..en];
-            st = en + 1;
-        }
-        if qc != 0 {
-            let mut good = 0u32;
-            for fld in out.iter_mut() {
-                let l = fld.len();
-                if l >= 2 && fld[0] == b'"' && fld[l - 1] == b'"' {
-                    good += 2;
-                    *fld = &fld[1..l - 1];
-                }
-            }
-            if good != qc {
-                return;
-            }
-        }
-        f(out);
-    };
+    let mut pad = [0u8; 128];
+    let mut commas = [0usize; N];
     while pos < n {
-        let (sep, nlm, q) = unsafe {
-            if pos + 64 <= n {
-                masks64(base.add(pos))
+        let rem = n - pos;
+        let (cm, nm, qm) = unsafe {
+            if rem >= 128 {
+                m128(base.add(pos))
             } else {
-                let rem = n - pos;
-                tail = [0u8; 64];
-                std::ptr::copy_nonoverlapping(base.add(pos), tail.as_mut_ptr(), rem);
-                masks64(tail.as_ptr())
+                pad = [0u8; 128];
+                std::ptr::copy_nonoverlapping(base.add(pos), pad.as_mut_ptr(), rem);
+                m128(pad.as_ptr())
             }
         };
-        let mut bits = sep | nlm;
-        while bits != 0 {
-            let t = bits.trailing_zeros();
-            let i = pos + t as usize;
-            if (nlm >> t) & 1 == 1 {
-                let below = q & ((1u64 << t).wrapping_sub(1));
-                let qc = qbase + below.count_ones() - q_line_start;
-                handle(line_start, i, nf, &commas, qc, &mut f);
-                line_start = i + 1;
-                nf = 0;
-                q_line_start = qbase + below.count_ones();
-            } else {
-                if nf < N - 1 {
-                    commas[nf] = i;
-                }
-                nf += 1;
+        if nm != 0 || rem <= 128 {
+            // line end within window (or at buffer end)
+            let le = if nm != 0 { nm.trailing_zeros() as usize } else { rem };
+            if le > rem {
+                // newline bit beyond data can't happen (pad zero), defensive
             }
-            bits &= bits - 1;
+            let below: u128 = if le >= 128 { !0 } else { (1u128 << le) - 1 };
+            let mut cb = cm & below;
+            let nc = cb.count_ones() as usize;
+            let qc = (qm & below).count_ones();
+            if nc == N - 1 {
+                for j in 0..N - 1 {
+                    commas[j] = cb.trailing_zeros() as usize;
+                    cb &= cb - 1;
+                }
+            }
+            let line = unsafe { std::slice::from_raw_parts(base.add(pos), le) };
+            emit_line::<N>(line, &commas, nc, qc, &mut f);
+            pos += le + 1;
+        } else {
+            // long line: scalar fallback
+            let le = match memchr(b'\n', &c[pos..]) {
+                Some(p) => p,
+                None => n - pos,
+            };
+            let line = &c[pos..pos + le];
+            let mut nc = 0usize;
+            let mut qc = 0u32;
+            for (i, &b) in line.iter().enumerate() {
+                if b == b',' {
+                    if nc < N - 1 {
+                        commas[nc] = i;
+                    }
+                    nc += 1;
+                } else if b == b'"' {
+                    qc += 1;
+                }
+            }
+            emit_line::<N>(line, &commas, nc, qc, &mut f);
+            pos += le + 1;
         }
-        qbase += q.count_ones();
-        pos += 64;
-    }
-    if line_start < n {
-        let qc = qbase - q_line_start;
-        handle(line_start, n, nf, &commas, qc, &mut f);
     }
 }
 
@@ -299,71 +345,100 @@ fn dg(c: u8) -> u32 {
 #[inline]
 fn parse_ts(b: &[u8]) -> Option<i64> {
     let n = b.len();
-    if n == 0 {
+    if n == 20 || n == 25 {
+        if b[4] == b'-' {
+            return parse_iso(b);
+        }
+    }
+    parse_f3(b)
+}
+
+#[inline(always)]
+fn parse_iso(b: &[u8]) -> Option<i64> {
+    let n = b.len();
+    let a = u64::from_le_bytes(b[0..8].try_into().unwrap()); // YYYY-MM-
+    let c = u64::from_le_bytes(b[8..16].try_into().unwrap()); // DDTHH:MM
+    let e = u32::from_le_bytes(b[16..20].try_into().unwrap()); // :SSZ or :SS+
+    // separators
+    const SA_MASK: u64 = 0xFF00_00FF_0000_0000;
+    const SA_VAL: u64 = (b'-' as u64) << 32 | (b'-' as u64) << 56;
+    const SC_MASK: u64 = 0x0000_FF00_00FF_0000;
+    const SC_VAL: u64 = (b'T' as u64) << 16 | (b':' as u64) << 40;
+    if (a & SA_MASK) != SA_VAL || (c & SC_MASK) != SC_VAL || (e & 0xFF) != b':' as u32 {
         return None;
     }
-    if (n == 20 || n == 25) && b[4] == b'-' {
-        if b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
-            return None;
-        }
-        let ds = [dg(b[0]), dg(b[1]), dg(b[2]), dg(b[3]), dg(b[5]), dg(b[6]), dg(b[8]), dg(b[9]), dg(b[11]), dg(b[12]), dg(b[14]), dg(b[15]), dg(b[17]), dg(b[18])];
-        if ds.iter().any(|&d| d > 9) {
-            return None;
-        }
-        let y = (ds[0] * 1000 + ds[1] * 100 + ds[2] * 10 + ds[3]) as i64;
-        let mo = (ds[4] * 10 + ds[5]) as i64;
-        let d = (ds[6] * 10 + ds[7]) as i64;
-        let h = (ds[8] * 10 + ds[9]) as i64;
-        let mi = (ds[10] * 10 + ds[11]) as i64;
-        let s = (ds[12] * 10 + ds[13]) as i64;
-        if mo < 1 || mo > 12 || h > 23 || mi > 59 || s > 59 || d < 1 {
-            return None;
-        }
-        let dim = match mo {
-            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-            4 | 6 | 9 | 11 => 30,
-            _ => {
-                if is_leap(y) {
-                    29
-                } else {
-                    28
-                }
-            }
-        };
-        if d > dim {
-            return None;
-        }
-        let days = if y >= Y0 && y < Y0 + NY { month_table()[((y - Y0) * 12 + mo - 1) as usize] + d - 1 } else { days_from_civil(y, mo, d) };
-        let mut ms = (days * 86400 + h * 3600 + mi * 60 + s) * 1000;
-        if n == 20 {
-            if b[19] != b'Z' {
-                return None;
-            }
-        } else {
-            let sign = match b[19] {
-                b'+' => 1,
-                b'-' => -1,
-                _ => return None,
-            };
-            if b[22] != b':' {
-                return None;
-            }
-            let (a, bb, cc, dd) = (dg(b[20]), dg(b[21]), dg(b[23]), dg(b[24]));
-            if a > 9 || bb > 9 || cc > 9 || dd > 9 {
-                return None;
-            }
-            let oh = (a * 10 + bb) as i64;
-            let om = (cc * 10 + dd) as i64;
-            if oh > 23 || om > 59 {
-                return None;
-            }
-            ms -= sign * (oh * 3600 + om * 60) * 1000;
-        }
-        return Some(ms);
+    let ta = a ^ 0x3030_3030_3030_3030;
+    let tc = c ^ 0x3030_3030_3030_3030;
+    let te = e ^ 0x3030_3030;
+    const DA: u64 = 0x00FF_FF00_FFFF_FFFF; // digit bytes in a: 0,1,2,3,5,6
+    const DC: u64 = 0xFFFF_00FF_FF00_FFFF; // digit bytes in c: 0,1,3,4,6,7
+    const DE: u32 = 0x00FF_FF00; // bytes 1,2
+    let bad_a = ((ta & 0xF0F0_F0F0_F0F0_F0F0) | (ta.wrapping_add(0x0606_0606_0606_0606) & 0x1010_1010_1010_1010)) & DA;
+    let bad_c = ((tc & 0xF0F0_F0F0_F0F0_F0F0) | (tc.wrapping_add(0x0606_0606_0606_0606) & 0x1010_1010_1010_1010)) & DC;
+    let bad_e = ((te & 0xF0F0_F0F0) | (te.wrapping_add(0x0606_0606) & 0x1010_1010)) & DE;
+    if (bad_a | bad_c) != 0 || bad_e != 0 {
+        return None;
     }
-    // F3: digits only
+    let g = |x: u64, i: u32| -> i64 { ((x >> (8 * i)) & 0xFF) as i64 };
+    let y = g(ta, 0) * 1000 + g(ta, 1) * 100 + g(ta, 2) * 10 + g(ta, 3);
+    let mo = g(ta, 5) * 10 + g(ta, 6);
+    let d = g(tc, 0) * 10 + g(tc, 1);
+    let h = g(tc, 3) * 10 + g(tc, 4);
+    let mi = g(tc, 6) * 10 + g(tc, 7);
+    let s = (((te >> 8) & 0xFF) * 10 + ((te >> 16) & 0xFF)) as i64;
+    if mo < 1 || mo > 12 || h > 23 || mi > 59 || s > 59 || d < 1 {
+        return None;
+    }
+    let dim = match mo {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            if is_leap(y) {
+                29
+            } else {
+                28
+            }
+        }
+    };
+    if d > dim {
+        return None;
+    }
+    let days = if y >= Y0 && y < Y0 + NY { month_table()[((y - Y0) * 12 + mo - 1) as usize] + d - 1 } else { days_from_civil(y, mo, d) };
+    let mut ms = (days * 86400 + h * 3600 + mi * 60 + s) * 1000;
+    if n == 20 {
+        if b[19] != b'Z' {
+            return None;
+        }
+    } else {
+        let sign = match b[19] {
+            b'+' => 1,
+            b'-' => -1,
+            _ => return None,
+        };
+        if b[22] != b':' {
+            return None;
+        }
+        let (p, q, r, t) = (dg(b[20]), dg(b[21]), dg(b[23]), dg(b[24]));
+        if p > 9 || q > 9 || r > 9 || t > 9 {
+            return None;
+        }
+        let oh = (p * 10 + q) as i64;
+        let om = (r * 10 + t) as i64;
+        if oh > 23 || om > 59 {
+            return None;
+        }
+        ms -= sign * (oh * 3600 + om * 60) * 1000;
+    }
+    Some(ms)
+}
+
+#[inline(always)]
+fn parse_f3(b: &[u8]) -> Option<i64> {
+    if b.is_empty() {
+        return None;
+    }
     let mut i = 0;
-    while i < n && b[i] == b'0' {
+    while i < b.len() && b[i] == b'0' {
         i += 1;
     }
     let r = &b[i..];
@@ -376,7 +451,6 @@ fn parse_ts(b: &[u8]) -> Option<i64> {
         v = v.wrapping_mul(10).wrapping_add(d as u64);
     }
     if r.len() > 19 || v > i64::MAX as u64 {
-        // still must be all digits (checked above) -> valid form, but out of any window
         return None;
     }
     Some(v as i64)
@@ -431,6 +505,49 @@ impl<V: Copy> StrMap<V> {
         }
         self.t.insert_unique(h, (k, v), |e| xxh3_64(e.0));
         (v, true)
+    }
+}
+
+// ---------------------------------------------------------------- software write-combining scatter
+const SWC: usize = 16;
+struct Scatter<T: Copy> {
+    buf: Vec<[std::mem::MaybeUninit<T>; SWC]>,
+    cnt: [u8; NP],
+    out: Vec<Vec<T>>,
+}
+impl<T: Copy> Scatter<T> {
+    fn new(est: usize) -> Self {
+        Scatter {
+            buf: (0..NP).map(|_| [std::mem::MaybeUninit::uninit(); SWC]).collect(),
+            cnt: [0; NP],
+            out: (0..NP).map(|_| Vec::with_capacity(est + est / 4)).collect(),
+        }
+    }
+    #[inline(always)]
+    fn push(&mut self, p: usize, v: T) {
+        unsafe {
+            let c = *self.cnt.get_unchecked(p) as usize;
+            let b = self.buf.get_unchecked_mut(p);
+            b.get_unchecked_mut(c).write(v);
+            if c + 1 == SWC {
+                let o = self.out.get_unchecked_mut(p);
+                o.extend_from_slice(std::slice::from_raw_parts(b.as_ptr() as *const T, SWC));
+                *self.cnt.get_unchecked_mut(p) = 0;
+            } else {
+                *self.cnt.get_unchecked_mut(p) = (c + 1) as u8;
+            }
+        }
+    }
+    fn finish(mut self) -> Vec<Vec<T>> {
+        for p in 0..NP {
+            let c = self.cnt[p] as usize;
+            if c > 0 {
+                let b = &self.buf[p];
+                let sl = unsafe { std::slice::from_raw_parts(b.as_ptr() as *const T, c) };
+                self.out[p].extend_from_slice(sl);
+            }
+        }
+        self.out
     }
 }
 
@@ -754,7 +871,7 @@ fn main() {
         .par_iter()
         .map(|&c| {
             let est = c.len() / 64 / NP + 16;
-            let mut parts: Vec<Vec<ERec>> = (0..NP).map(|_| Vec::with_capacity(est + est / 4)).collect();
+            let mut parts = Scatter::<ERec>::new(est);
             let ctx = &*ctx;
             scan::<7>(c, |f| {
                 let [eid, uid, ts_s, ing_s, typ_s, pid, price_s] = f;
@@ -793,9 +910,9 @@ fn main() {
                         None => valid = false,
                     }
                 }
-                parts[(h >> NP_SHIFT) as usize].push(ERec { h, ingest, eid, uid, ts: tsv, price, cat, typ, valid });
+                parts.push((h >> NP_SHIFT) as usize, ERec { h, ingest, eid, uid, ts: tsv, price, cat, typ, valid });
             });
-            parts
+            parts.finish()
         })
         .collect();
     tlog!(t0, "events parsed: {} chunks", ev_chunks.len());
@@ -806,7 +923,7 @@ fn main() {
         .map(|pi| {
             let n: usize = parted.iter().map(|p| p[pi].len()).sum();
             let est = n / NP + 16;
-            let mut outp: Vec<Vec<UEv>> = (0..NP).map(|_| Vec::with_capacity(est + est / 3)).collect();
+            let mut outp = Scatter::<UEv>::new(est);
             let mut tab: HashTable<(u64, i64, *const ERec)> = HashTable::with_capacity(n);
             for p in &parted {
                 for r in &p[pi] {
@@ -835,14 +952,15 @@ fn main() {
                     if let Some(e) = win {
                         if e.2 == rp {
                             let (uh, uh2) = hh(r.uid);
-                            outp[(uh >> NP_SHIFT) as usize].push(UEv { uh, uh2, uid: r.uid, ts: r.ts, price: r.price, cat: r.cat, typ: r.typ });
+                            outp.push((uh >> NP_SHIFT) as usize, UEv { uh, uh2, uid: r.uid, ts: r.ts, price: r.price, cat: r.cat, typ: r.typ });
                         }
                     }
                 }
             }
-            outp
+            outp.finish()
         })
         .collect();
+    drop(parted);
     tlog!(t0, "events deduped");
 
     // ---- clicks: parse, validate, bucket by uid hash
@@ -853,7 +971,7 @@ fn main() {
         .par_iter()
         .map(|&c| {
             let est = c.len() / 48 / NP + 16;
-            let mut parts: Vec<Vec<UCl>> = (0..NP).map(|_| Vec::with_capacity(est + est / 3)).collect();
+            let mut parts = Scatter::<UCl>::new(est);
             let ctx = &*ctx;
             scan::<4>(c, |f| {
                 let [cid, uid, camp_s, ts_s] = f;
@@ -869,9 +987,9 @@ fn main() {
                     None => return,
                 };
                 let (uh, uh2) = hh(uid);
-                parts[(uh >> NP_SHIFT) as usize].push(UCl { uh, uh2, ts, cid, camp: ci });
+                parts.push((uh >> NP_SHIFT) as usize, UCl { uh, uh2, ts, cid, camp: ci });
             });
-            parts
+            parts.finish()
         })
         .collect();
     tlog!(t0, "clicks parsed: {} chunks", cl_chunks.len());
@@ -885,15 +1003,15 @@ fn main() {
             let nc: usize = ucls.iter().map(|p| p[bi].len()).sum();
             let ee = ne / NP + 16;
             let ce = nc / NP + 16;
-            let mut eo: Vec<Vec<PEv>> = (0..NP).map(|_| Vec::with_capacity(ee + ee / 3)).collect();
-            let mut co: Vec<Vec<PCl>> = (0..NP).map(|_| Vec::with_capacity(ce + ce / 3)).collect();
+            let mut eo = Scatter::<PEv>::new(ee);
+            let mut co = Scatter::<PCl>::new(ce);
             for p in &uevs {
                 for u in &p[bi] {
                     let (nh, name) = match t.find(u.uh.rotate_left(24), |x| x.h == u.uh && x.h2 == u.uh2) {
                         Some(x) => (x.nh, x.name),
                         None => (u.uh, u.uid),
                     };
-                    eo[(nh >> NP_SHIFT) as usize].push(PEv { nh, ts: u.ts, name, price: u.price, cat: u.cat, typ: u.typ });
+                    eo.push((nh >> NP_SHIFT) as usize, PEv { nh, ts: u.ts, name, price: u.price, cat: u.cat, typ: u.typ });
                 }
             }
             for p in &ucls {
@@ -902,15 +1020,14 @@ fn main() {
                         Some(x) => x.nh,
                         None => u.uh,
                     };
-                    co[(nh >> NP_SHIFT) as usize].push(PCl { nh, ts: u.ts, cid: u.cid, camp: u.camp });
+                    co.push((nh >> NP_SHIFT) as usize, PCl { nh, ts: u.ts, cid: u.cid, camp: u.camp });
                 }
             }
-            (eo, co)
+            (eo.finish(), co.finish())
         })
         .collect();
     drop(uevs);
     drop(ucls);
-    drop(parted);
     let (deduped, clicks): (Vec<Vec<Vec<PEv>>>, Vec<Vec<Vec<PCl>>>) = resolved.into_iter().unzip();
     tlog!(t0, "persons resolved");
 
