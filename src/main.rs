@@ -820,6 +820,9 @@ fn main() {
     }
     let ncamp = camp_names.len();
 
+    let ctx = Arc::new(Ctx { ws, we, prod, ncat, camp });
+    let (ltabs, parted) = rayon::join(
+        || {
     // ---- links (parallel, partitioned by id hash)
     let ln_chunks = chunks_of(&ln_bufs, 1 << 20);
     let pairs: Vec<Vec<(S, S)>> = ln_chunks
@@ -964,9 +967,9 @@ fn main() {
         })
         .collect();
     tlog!(t0, "links: {} pairs, {} ids", npairs, nid);
-
-    let ctx = Arc::new(Ctx { ws, we, prod, ncat, camp });
-
+            ltabs
+        },
+        || {
     // ---- events: parse and partition by event_id hash
     let ev_chunk_size = (ev_total / (nthreads * 6)).clamp(1 << 20, 64 << 20);
     let ev_chunks = chunks_of(&ev_bufs, ev_chunk_size);
@@ -1026,7 +1029,11 @@ fn main() {
         })
         .collect();
     tlog!(t0, "events parsed: {} chunks", ev_chunks.len());
-
+            parted
+        },
+    );
+    let (deduped, clicks) = rayon::join(
+        || {
     // ---- dedup per eid partition -> survivors bucketed by uid hash
     let deduped: Vec<Vec<Vec<PEv>>> = (0..NP)
         .into_par_iter()
@@ -1082,7 +1089,9 @@ fn main() {
         .collect();
     drop(parted);
     tlog!(t0, "events deduped");
-
+            deduped
+        },
+        || {
     // ---- clicks: parse, validate, bucket by uid hash
     let cws = ws - WEEK;
     let cl_chunk_size = (cl_total / (nthreads * 4)).clamp(1 << 20, 64 << 20);
@@ -1118,6 +1127,9 @@ fn main() {
         })
         .collect();
     tlog!(t0, "clicks parsed: {} chunks", cl_chunks.len());
+            clicks
+        },
+    );
 
     tlog!(t0, "persons resolved");
 
@@ -1461,7 +1473,21 @@ fn write_user_daily(path: &Path, groups: &[&Vec<URow>], cats: &[S], _ws_day: i64
     while let Some(mut cw) = rg.next_column().unwrap() {
         match col {
             0 => {
-                let v: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.name.to_vec())).collect();
+                let total: usize = rows.iter().map(|r| r.name.len()).sum();
+                let mut buf: Vec<u8> = Vec::with_capacity(total);
+                for r in &rows {
+                    buf.extend_from_slice(r.name);
+                }
+                let big = bytes::Bytes::from(buf);
+                let mut off = 0usize;
+                let v: Vec<ByteArray> = rows
+                    .iter()
+                    .map(|r| {
+                        let b = ByteArray::from(big.slice(off..off + r.name.len()));
+                        off += r.name.len();
+                        b
+                    })
+                    .collect();
                 cw.typed::<ByteArrayType>().write_batch(&v, None, None).unwrap();
             }
             1 => {
@@ -1481,7 +1507,8 @@ fn write_user_daily(path: &Path, groups: &[&Vec<URow>], cats: &[S], _ws_day: i64
             }
             _ => {
                 let defs: Vec<i16> = rows.iter().map(|r| if r.top >= 0 { 1 } else { 0 }).collect();
-                let v: Vec<ByteArray> = rows.iter().filter(|r| r.top >= 0).map(|r| ByteArray::from(cats[r.top as usize].to_vec())).collect();
+                let cb: Vec<ByteArray> = cats.iter().map(|c| ByteArray::from(c.to_vec())).collect();
+                let v: Vec<ByteArray> = rows.iter().filter(|r| r.top >= 0).map(|r| cb[r.top as usize].clone()).collect();
                 cw.typed::<ByteArrayType>().write_batch(&v, Some(&defs), None).unwrap();
             }
         }

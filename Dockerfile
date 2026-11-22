@@ -8,6 +8,6 @@ RUN cargo build --release && strip target/release/shopping
 FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=build /src/target/release/shopping /app/shopping
-ENV MIMALLOC_ALLOW_LARGE_OS_PAGES=1 SS_QUIET=1
+ENV MIMALLOC_ALLOW_LARGE_OS_PAGES=1 MIMALLOC_PURGE_DELAY=-1 MIMALLOC_ARENA_EAGER_COMMIT=1 SS_QUIET=1
 USER 1000
 ENTRYPOINT ["/app/shopping"]
